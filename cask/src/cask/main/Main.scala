@@ -2,8 +2,7 @@ package cask.main
 
 import cask.endpoints.{WebsocketResult, WsHandler}
 import cask.model._
-import cask.internal.{DispatchTrie, Util}
-import cask.main
+import cask.internal.{DispatchTrie, ThreadBlockingHandler, Util}
 import cask.router.{Decorator, EndpointMetadata, EntryPoint, RawDecorator, Result}
 import cask.util.Logger
 import io.undertow.Undertow
@@ -11,7 +10,7 @@ import io.undertow.server.{HttpHandler, HttpServerExchange}
 import io.undertow.server.handlers.BlockingHandler
 import io.undertow.util.HttpString
 
-import scala.concurrent.ExecutionContext
+import java.util.concurrent.Executor
 
 /**
   * A combination of [[cask.Main]] and [[cask.Routes]], ideal for small
@@ -46,9 +45,30 @@ abstract class Main{
 
   def dispatchTrie = Main.prepareDispatchTrie(allRoutes)
 
-  def defaultHandler = new BlockingHandler(
-    new Main.DefaultHandler(dispatchTrie, mainDecorators, debugMode, handleNotFound, handleMethodNotAllowed, handleEndpointError)
-  )
+  /**
+   * The handler that will be used to handle incoming requests. By default,
+   * when a handler is provided, a default handler will be used,
+   * otherwise the provided executor will be used to handle requests.
+   *
+   * When `cask.virtual-threads.enabled` is set to `true` and running with a JDK
+   * where virtual threads are supported, then a virtual thread executor will be used.
+   * */
+  protected def handlerExecutor(): Option[Executor] = {
+    for {
+      config <- Option(System.getProperty(Main.VIRTUAL_THREAD_ENABLED))
+      if config.toBoolean
+      executor <- Util.createDefaultCaskVirtualThreadExecutor
+    } yield executor
+  }
+
+  def defaultHandler: HttpHandler = {
+    val mainHandler = new Main.DefaultHandler(
+      dispatchTrie, mainDecorators, debugMode, handleNotFound, handleMethodNotAllowed, handleEndpointError)
+    handlerExecutor() match {
+      case None => new BlockingHandler(mainHandler)
+      case Some(executor) => new ThreadBlockingHandler(executor, mainHandler)
+    }
+  }
 
   def handleNotFound(req: Request): Response.Raw = Main.defaultHandleNotFound(req)
 
@@ -72,7 +92,12 @@ abstract class Main{
 
 }
 
-object Main{
+object Main {
+  /**
+   * property key to enable virtual thread support.
+   * */
+  val VIRTUAL_THREAD_ENABLED = "cask.virtual-threads.enabled"
+
   class DefaultHandler(dispatchTrie: DispatchTrie[Map[String, (Routes, EndpointMetadata[_])]],
                        mainDecorators: Seq[Decorator[_, _, _, _]],
                        debugMode: Boolean,
@@ -86,7 +111,7 @@ object Main{
         Tuple2(
           "websocket",
           (r: Any) =>
-            r.asInstanceOf[WebsocketResult] match{
+            r.asInstanceOf[WebsocketResult] match {
               case l: WsHandler =>
                 io.undertow.Handlers.websocket(l).handleRequest(exchange)
               case l: WebsocketResult.Listener =>
@@ -131,8 +156,9 @@ object Main{
               }
           }
       }
-    }catch{case e: Throwable =>
-      e.printStackTrace()
+    } catch {
+      case e: Throwable =>
+        e.printStackTrace()
     }
   }
 
@@ -160,7 +186,7 @@ object Main{
       val methodMap = methods.toMap[String, (Routes, EndpointMetadata[_])]
       val subpath =
         metadata.endpoint.subpath ||
-        metadata.entryPoint.argSignatures.exists(_.exists(_.reads.remainingPathSegments))
+          metadata.entryPoint.argSignatures.exists(_.exists(_.reads.remainingPathSegments))
 
       (segments, methodMap, subpath)
     }
@@ -175,10 +201,10 @@ object Main{
   }
 
   def writeResponse(exchange: HttpServerExchange, response: Response.Raw) = {
-    response.data.headers.foreach{case (k, v) =>
+    response.data.headers.foreach { case (k, v) =>
       exchange.getResponseHeaders.put(new HttpString(k), v)
     }
-    response.headers.foreach{case (k, v) =>
+    response.headers.foreach { case (k, v) =>
       exchange.getResponseHeaders.put(new HttpString(k), v)
     }
     response.cookies.foreach(c => exchange.setResponseCookie(Cookie.toUndertow(c)))
